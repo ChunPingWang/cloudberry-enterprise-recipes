@@ -20,6 +20,7 @@
   - [Phase 5：MPP Stored Procedure 與企業實戰](#phase-5mpp-stored-procedure-與企業實戰)
   - [Phase 6：資料匯入匯出與品質管控](#phase-6資料匯入匯出與品質管控)
   - [Phase 7：端到端資料傾斜修正案例](#phase-7端到端資料傾斜修正案例)
+  - [Phase 8：PostgreSQL vs Cloudberry SP 差異](#phase-8postgresql-vs-cloudberry-sp-差異)
 - [測試結果總覽](#測試結果總覽)
 - [參考資源](#參考資源)
 
@@ -646,9 +647,65 @@ Phase 5 — 前後對比報告
 
 ---
 
+### Phase 8：PostgreSQL vs Cloudberry SP 差異
+
+#### `20-pg-vs-cloudberry-sp.sql` — SP 關鍵差異系統性對比
+
+Cloudberry 相容 PostgreSQL 語法，但 MPP 分散式架構對 SP 有根本性差異。本腳本以 **200K 訂單 / 600K 明細** 的測試資料，逐一展示 7 個核心差異並提供正確寫法。
+
+| # | 差異點 | PostgreSQL（單節點） | Cloudberry（MPP） | 實測數據 |
+|---|--------|---------------------|-------------------|----------|
+| 1 | CURSOR 逐行 | 慢但可用 | 效能災難（破壞並行） | **3,181ms vs 30ms（106x 差距）** |
+| 2 | COMMIT + EXCEPTION | 可以 | 不行（subtransaction 限制） | 報錯 `invalid transaction termination` |
+| 3 | VOLATILE in WHERE | 呼叫 1 次 | 每 Segment 各呼叫 N 次 | subquery 包裹後只呼叫 1 次 |
+| 4 | JOIN 效能 | 看索引 | 看分佈鍵 | Co-located 無 Motion vs Redistribute |
+| 5 | EXECUTE ON | 無此功能 | 控制 Coordinator/Segments 執行 | Cloudberry 獨有 |
+| 6 | DDL in FUNCTION | 自由使用 | 全叢集鎖 | 改用 PROCEDURE |
+| 7 | REPLICATED 表 | 無此概念 | 小表複製，消除 JOIN Motion | EXPLAIN 無 Broadcast |
+
+**差異 1 實測：CURSOR vs SET-BASED（同樣更新 1,000 筆）**
+
+```
+❌ CURSOR 逐行：3,181ms（每次 FETCH 從 Segment 拉 1 行 → 序列化）
+✅ SET-BASED：   30ms（UPDATE 分發到所有 Segment 並行執行）
+→ 效能差距 106 倍
+```
+
+**差異 3 實測：VOLATILE 函數在 WHERE 中**
+
+```
+❌ 直接使用：函數在每個 Segment 各執行一次
+   → 若函數有副作用（INSERT），會在 Segment 上報錯
+✅ subquery 包裹：(SELECT fn_volatile()) → 只在 Coordinator 執行 1 次
+```
+
+**差異 4 實測：JOIN 效能**
+
+```
+✅ Co-located（orders + items 都以 order_id 分佈）：
+   → EXPLAIN 中無 Redistribute Motion，本地 JOIN
+
+❌ 分佈鍵不一致（items 以 product_id 分佈）：
+   → EXPLAIN 出現 Redistribute Motion 3:3 + Broadcast Motion 3:3
+   → 大表時效能差距可達 10x 以上
+```
+
+**MPP SP 黃金守則：**
+
+```
+1. SET-BASED 優先，永遠不要 CURSOR 逐行
+2. EXCEPTION 中不做 COMMIT / DML
+3. VOLATILE 函數放 subquery，確保只呼叫一次
+4. JOIN 的表用相同分佈鍵（Co-located）
+5. 小型維度表用 DISTRIBUTED REPLICATED
+6. 需要 DDL 的 ETL 用 PROCEDURE，不用 FUNCTION
+```
+
+---
+
 ## 測試結果總覽
 
-所有 12 個 SQL 腳本均已在 Cloudberry 3.0.0-devel Sandbox 上實測通過：
+所有 SQL 腳本均已在 Cloudberry 3.0.0-devel Sandbox 上實測通過：
 
 ```
 ✓ 03-cluster-architecture.sql     Ch.5  叢集架構深度解析
@@ -664,8 +721,9 @@ Phase 5 — 前後對比報告
 ✓ 16-error-handling-dq.sql        Ch.19 錯誤處理與品質管控
 ✓ 17-etl-pipeline.sql             Ch.20 ETL Pipeline
 ✓ 19-skew-diagnosis-fix.sql       傾斜診斷與修正
+✓ 20-pg-vs-cloudberry-sp.sql      PG vs Cloudberry SP 差異
 
-結果：13/13 通過 | 0 錯誤
+結果：14/14 通過 | 0 錯誤
 ```
 
 ### 測試過程中發現並修正的 Cloudberry 3.x 相容性問題
@@ -708,6 +766,7 @@ cloudberry-enterprise-recipes/
     ├── 17-etl-pipeline.sql               ← ETL Pipeline
     ├── 18-cleanup.sql                     ← 清理測試物件
     ├── 19-skew-diagnosis-fix.sql          ← 傾斜診斷與修正
+    ├── 20-pg-vs-cloudberry-sp.sql         ← PG vs Cloudberry SP 差異
     ├── run-all-poc.sh                     ← 一鍵執行全部
     └── README.md                          ← 腳本索引
 ```
